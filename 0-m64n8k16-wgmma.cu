@@ -25,9 +25,9 @@ __global__ void wgmma_m64n8k16(bf16 *a, bf16 *b, float *c)
     bf16 *a_shmem = shmem;
     bf16 *b_shmem = shmem + TILE_M * TILE_K;
 
-    // int lane_id = threadIdx.x % 32;
-    // int warp_id = threadIdx.x / 32;
     int thread_id = threadIdx.x;
+    int lane_id = thread_id % 32;
+    int warp_id = thread_id / 32;
 
     const int core_rows = 8;
     const int core_k = 16 / sizeof(bf16);
