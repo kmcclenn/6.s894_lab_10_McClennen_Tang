@@ -19,23 +19,144 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 
 template <int TILE_M, int TILE_N, int TILE_K>
-__global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
+__global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c, __grid_constant__ const CUtensorMap a_map, __grid_constant__ const CUtensorMap b_map)
+{
 
-    // <--- your code here --->
+    extern __shared__ __align__(128) bf16 shmem[];
+    bf16 *a_vals = shmem;
+    bf16 *b_vals = a_vals + TILE_M * TILE_K;
 
+    __shared__ uint64_t mbar_a;
+    __shared__ uint64_t mbar_b;
+
+    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // TMA load
+    if (threadIdx.x == 0 && threadIdx.y == 0)
+    {
+        // Initialize mem bar with arrival count of 1
+        init_barrier(&mbar_a, 1);
+
+        // // proxy barrier
+        async_proxy_fence();
+
+        // // Add expected number of bytes ot mem bar
+        expect_bytes_and_arrive(&mbar_a, TILE_M * TILE_K * sizeof(bf16));
+
+        // // Execute TMA load
+        cp_async_bulk_tensor_2d_global_to_shared(a_vals, &a_map, 0, 0, &mbar_a);
+
+        // // Wait for async load bytes to arrive
+        wait(&mbar_a, 0);
+    }
+    if (threadIdx.x == 1 && threadIdx.y == 0)
+    {
+        // Initialize mem bar with arrival count of 1
+        init_barrier(&mbar_b, 1);
+
+        // // proxy barrier
+        async_proxy_fence();
+
+        // // Add expected number of bytes ot mem bar
+        expect_bytes_and_arrive(&mbar_b, TILE_K * TILE_N * sizeof(bf16));
+
+        // // Execute TMA load
+        cp_async_bulk_tensor_2d_global_to_shared(b_vals, &b_map, 0, 0, &mbar_b);
+
+        // // Wait for async load bytes to arrive
+        wait(&mbar_b, 0);
+    }
+
+    __syncthreads();
+
+    uint64_t a_desc_1 = make_smem_desc<SWIZZLE_64B>(a_vals, 1, 512);
+    uint64_t b_desc_1 = make_smem_desc<SWIZZLE_64B>(b_vals, 1, 512);
+
+    uint64_t a_desc_2 = make_smem_desc<SWIZZLE_64B>(a_vals + 16, 1, 512);
+    uint64_t b_desc_2 = make_smem_desc<SWIZZLE_64B>(b_vals + 16, 1, 512);
+
+    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    warpgroup_arrive();
+
+    wgmma_n8<1, 1, 1, 0, 0>(a_desc_1, b_desc_1, d);
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    warpgroup_arrive();
+
+    wgmma_n8<1, 1, 1, 0, 0>(a_desc_2, b_desc_2, d);
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    int x = threadIdx.x;
+    int y = threadIdx.y;
+
+    for (int i = 0; i < 2; i++)
+    {
+        int m = 16 * y + (8 * i) + x / 4;
+        for (int j = 0; j < 2; j++)
+        {
+            int n = (x % 4) * 2 + j;
+            c[n * TILE_M + m] = d[i * 2 + j];
+        }
+    }
 }
 
 template <int TILE_M, int TILE_N, int TILE_K>
-void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
+void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c)
+{
 
     // <--- your code here --->
+    dim3 threads = dim3(32, 4); // one group
+    int shmem_size = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16);
+
+    const cuuint64_t globalDimA[2] = {TILE_K, TILE_M};
+    const cuuint64_t globalStrides[1] = {TILE_K * sizeof(bf16)};
+    const cuuint32_t boxDimA[2] = {TILE_K, TILE_M};
+    const cuuint32_t elementStrides[2] = {1, 1};
+    CUtensorMap a_map;
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &a_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        (void *)a,
+        globalDimA,
+        globalStrides,
+        boxDimA,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    const cuuint64_t globalDimB[2] = {TILE_K, TILE_N};
+    const cuuint32_t boxDimB[2] = {TILE_K, TILE_N};
+    CUtensorMap b_map;
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &b_map,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            (void *)b,
+            globalDimB,
+            globalStrides,
+            boxDimB,
+            elementStrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_64B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    swizzle_wgmma_m64n8k32<TILE_M, TILE_N, TILE_K><<<1, threads, shmem_size>>>(a, b, c, a_map, b_map);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
 ////////////////////////////////////////////////////////////////////////////////
 
-int main() {
+int main()
+{
     const int M = 64;
     const int N = 8;
     const int K = 32;
@@ -43,13 +164,17 @@ int main() {
     // Initialize source matrix on host
     bf16 *a = (bf16 *)malloc(M * K * sizeof(bf16));
     bf16 *b = (bf16 *)malloc(N * K * sizeof(bf16));
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < K; j++) {
+    for (int i = 0; i < M; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
             a[i * K + j] = (i + j) / 10.0f;
         }
     }
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < K; j++) {
+    for (int i = 0; i < N; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
             b[j * N + i] = (i + j) / 10.0f;
         }
     }
@@ -64,10 +189,13 @@ int main() {
 
     // Compute CPU reference
     float *cpu_output = (float *)malloc(M * N * sizeof(float));
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
+    for (int i = 0; i < M; i++)
+    {
+        for (int j = 0; j < N; j++)
+        {
             float temp = 0.0f;
-            for (int k = 0; k < K; k++) {
+            for (int k = 0; k < K; k++)
+            {
                 float a_row = (float)a[i * K + k];
                 float a_col = (float)b[k + j * K];
                 temp += a_row * a_col;
@@ -77,7 +205,8 @@ int main() {
     }
 
     float *gpu_output = (float *)malloc(M * N * sizeof(float));
-    for (int i = 0; i < M * N; i++) {
+    for (int i = 0; i < M * N; i++)
+    {
         gpu_output[i] = 0;
     }
     cudaMemcpy(d_c, gpu_output, M * N * sizeof(float), cudaMemcpyHostToDevice);
@@ -91,8 +220,10 @@ int main() {
 
     // check results
     bool correct = true;
-    for (int idx = 0; idx < M * N; idx++) {
-        if (fabs(cpu_output[idx] - gpu_output[idx]) > 0.01f) {
+    for (int idx = 0; idx < M * N; idx++)
+    {
+        if (fabs(cpu_output[idx] - gpu_output[idx]) > 0.01f)
+        {
             correct = false;
             int j = idx / M;
             int i = idx % M;

@@ -100,6 +100,7 @@ void launch_wgmma_m64n8k16(bf16 *a, bf16 *b, float *c)
     // <--- your code here --->
     dim3 threads = dim3(32, 4); // one group
     int shmem_size = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16);
+    
 
     wgmma_m64n8k16<TILE_M, TILE_N, TILE_K><<<1, threads, shmem_size>>>(a, b, c);
 }
