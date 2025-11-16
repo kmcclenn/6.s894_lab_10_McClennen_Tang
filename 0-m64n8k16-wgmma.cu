@@ -78,7 +78,6 @@ __global__ void wgmma_m64n8k16(bf16 *a, bf16 *b, float *c)
     float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     warpgroup_arrive();
-
     wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d);
     wgmma_commit();
     wgmma_wait<0>();

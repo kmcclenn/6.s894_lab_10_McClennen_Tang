@@ -18,69 +18,53 @@ typedef __nv_bfloat16 bf16;
 // Part 0: 64B Swizzle WGGMA load for M = 64, N = 8, K = 32
 ////////////////////////////////////////////////////////////////////////////////
 
-template <int TILE_M, int TILE_N, int TILE_K>
-__global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c)
+__device__ inline uint swizzle_64b_col(bf16 *row_base_ptr, uint col)
 {
+    uint64_t row_base_addr = reinterpret_cast<uint64_t>(row_base_ptr);
+    uint sw = ((row_base_addr >> 7) & 0xb11) << 4;
+    return col ^ sw;
+}
 
-    extern __shared__ bf16 shmem[];
-    bf16 *a_shmem = shmem;
-    bf16 *b_shmem = shmem + TILE_M * TILE_K;
+template <int TILE_M, int TILE_N, int TILE_K>
+__global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c, __grid_constant__ const CUtensorMap a_map, __grid_constant__ const CUtensorMap b_map)
+{
+    extern __shared__ __align__(128) unsigned char shmem_raw[];
+    bf16 *a_shmem = reinterpret_cast<bf16 *>(shmem_raw);
+    bf16 *b_shmem = a_shmem + (TILE_M * TILE_K);
+
+    size_t tile_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16);
+    size_t mbar_off = (tile_bytes + 16) & ~size_t(16);
+    uint64_t *mbar = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
 
     int thread_id = threadIdx.x;
     int lane_id = thread_id % 32;
     int warp_id = thread_id / 32;
 
-    const int core_rows = 8;
-    const int core_k = 16 / sizeof(bf16);
-
-    // int num_core_rows = TILE_M / core_rows;
-    int num_core_k = TILE_K / core_k;
-
-    for (int a_idx = thread_id; a_idx < TILE_M * TILE_K; a_idx += WARP_GROUP_THREADS)
+    if (thread_id == 0)
     {
-        int m = a_idx / TILE_K;
-        int k = a_idx % TILE_K;
-        int core_rows_id = (m / core_rows);
-        int core_k_id = (k / core_k);
+        init_barrier(mbar, 1);
+        async_proxy_fence();
 
-        int core_id = core_rows_id * num_core_k + core_k_id;
-        int core_offset = core_id * (core_rows * core_k);
+        cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &a_map, 0, 0, mbar);
+        expect_bytes_and_arrive(mbar, TILE_M * TILE_K * sizeof(bf16));
 
-        int core_rows_offset = m % core_rows;
-        int core_k_offset = k % core_k;
-
-        int shmem_idx = core_offset + core_rows_offset * core_k + core_k_offset;
-        a_shmem[shmem_idx] = a[m * TILE_K + k];
+        wait(mbar, 0);
+        cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &b_map, 0, 0, mbar);
+        expect_bytes_and_arrive(mbar, TILE_N * TILE_K * sizeof(bf16));
+        wait(mbar, 1);
     }
 
-    for (int b_idx = thread_id; b_idx < TILE_N * TILE_K; b_idx += WARP_GROUP_THREADS)
-    {
-        int n = b_idx / TILE_K;
-        int k = b_idx % TILE_K;
+    uint64_t desc_a0 = make_smem_desc<SWIZZLE_64B>(a_shmem, 1, 512);
+    uint64_t desc_b0 = make_smem_desc<SWIZZLE_64B>(b_shmem, 1, 512);
 
-        int core_rows_id = (n / core_rows);
-        int core_k_id = (k / core_k);
-
-        int core_id = core_rows_id * num_core_k + core_k_id;
-        int core_offset = core_id * (core_rows * core_k);
-
-        int core_rows_offset = n % core_rows;
-        int core_k_offset = k % core_k;
-
-        int shmem_idx = core_offset + core_rows_offset * core_k + core_k_offset;
-        b_shmem[shmem_idx] = b[n * TILE_K + k];
-    }
-
-    __syncthreads();
-
-    uint64_t desc_a = make_smem_desc<NO_SWIZZLE>(a_shmem, 128, 128 * 2);
-    uint64_t desc_b = make_smem_desc<NO_SWIZZLE>(b_shmem, 128, 128 * 2);
+    uint64_t desc_a1 = make_smem_desc<SWIZZLE_64B>(a_shmem + 16, 1, 512);
+    uint64_t desc_b1 = make_smem_desc<SWIZZLE_64B>(b_shmem + 16, 1, 512);
 
     float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     warpgroup_arrive();
-
-    wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d);
+    wgmma_n8<1, 1, 1, 0, 0>(desc_a0, desc_b0, d);
+    wgmma_n8<1, 1, 1, 0, 0>(desc_a1, desc_b1, d);
     wgmma_commit();
     wgmma_wait<0>();
 
@@ -98,10 +82,48 @@ __global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c)
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c)
 {
+    CUtensorMap a_map;
+    const cuuint64_t global_dim[2] = {TILE_K, TILE_M};
+    const cuuint64_t global_strides[1] = {TILE_K * sizeof(bf16)};
+    const cuuint32_t box_dim[2] = {TILE_K, TILE_M};
+    const cuuint32_t element_strides[2] = {1, 1};
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &a_map,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            a,
+            global_dim,
+            global_strides,
+            box_dim,
+            element_strides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_64B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16);
+    CUtensorMap b_map;
+    const cuuint64_t global_dim_b[2] = {TILE_K, TILE_N};
+    const cuuint64_t global_strides_b[1] = {TILE_K * sizeof(bf16)};
+    const cuuint32_t box_dim_b[2] = {TILE_K, TILE_N};
+    const cuuint32_t element_strides_b[2] = {1, 1};
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &b_map,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            b,
+            global_dim_b,
+            global_strides_b,
+            box_dim_b,
+            element_strides_b,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_64B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    wgmma_m64n8k16<TILE_M, TILE_N, TILE_K><<<1, WARP_GROUP_THREADS, shmem_size_bytes>>>(a, b, c);
+    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) + sizeof(uint64_t) * 2;
+    swizzle_wgmma_m64n8k32<TILE_M, TILE_N, TILE_K><<<1, WARP_GROUP_THREADS, shmem_size_bytes>>>(a, b, c, a_map, b_map);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -173,6 +195,7 @@ int main()
 
     // check results
     bool correct = true;
+    int num_incorrect = 0;
     for (int idx = 0; idx < M * N; idx++)
     {
         if (fabs(cpu_output[idx] - gpu_output[idx]) > 0.01f)
@@ -181,12 +204,18 @@ int main()
             int j = idx / M;
             int i = idx % M;
             printf(
-                "\nFirst mismatch at (%d, %d): CPU=%.0f, GPU=%.0f\n",
+                "\n mismatch at (%d, %d): CPU=%.0f, GPU=%.0f\n",
                 i,
                 j,
                 cpu_output[idx],
                 gpu_output[idx]);
-            break;
+
+            num_incorrect++;
+            if (num_incorrect > 10)
+            {
+                break;
+            }
+            // break;
         }
     }
 
