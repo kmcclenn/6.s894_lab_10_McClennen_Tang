@@ -13,17 +13,10 @@
 typedef __nv_bfloat16 bf16;
 
 /// <--- your code here --->
-#define WARP_GROUP_THREADS 128
+
 ////////////////////////////////////////////////////////////////////////////////
 // Part 0: 64B Swizzle WGGMA load for M = 64, N = 8, K = 32
 ////////////////////////////////////////////////////////////////////////////////
-
-__device__ inline uint swizzle_64b_col(bf16 *row_base_ptr, uint col)
-{
-    uint64_t row_base_addr = reinterpret_cast<uint64_t>(row_base_ptr);
-    uint sw = ((row_base_addr >> 7) & 0xb11) << 4;
-    return col ^ sw;
-}
 
 template <int TILE_M, int TILE_N, int TILE_K>
 __global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c, __grid_constant__ const CUtensorMap a_map, __grid_constant__ const CUtensorMap b_map)
@@ -130,8 +123,7 @@ void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c)
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
 ////////////////////////////////////////////////////////////////////////////////
 
-int main()
-{
+int main() {
     const int M = 64;
     const int N = 8;
     const int K = 32;
@@ -139,17 +131,13 @@ int main()
     // Initialize source matrix on host
     bf16 *a = (bf16 *)malloc(M * K * sizeof(bf16));
     bf16 *b = (bf16 *)malloc(N * K * sizeof(bf16));
-    for (int i = 0; i < M; i++)
-    {
-        for (int j = 0; j < K; j++)
-        {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < K; j++) {
             a[i * K + j] = (i + j) / 10.0f;
         }
     }
-    for (int i = 0; i < N; i++)
-    {
-        for (int j = 0; j < K; j++)
-        {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < K; j++) {
             b[j * N + i] = (i + j) / 10.0f;
         }
     }
@@ -164,13 +152,10 @@ int main()
 
     // Compute CPU reference
     float *cpu_output = (float *)malloc(M * N * sizeof(float));
-    for (int i = 0; i < M; i++)
-    {
-        for (int j = 0; j < N; j++)
-        {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
             float temp = 0.0f;
-            for (int k = 0; k < K; k++)
-            {
+            for (int k = 0; k < K; k++) {
                 float a_row = (float)a[i * K + k];
                 float a_col = (float)b[k + j * K];
                 temp += a_row * a_col;
@@ -180,8 +165,7 @@ int main()
     }
 
     float *gpu_output = (float *)malloc(M * N * sizeof(float));
-    for (int i = 0; i < M * N; i++)
-    {
+    for (int i = 0; i < M * N; i++) {
         gpu_output[i] = 0;
     }
     cudaMemcpy(d_c, gpu_output, M * N * sizeof(float), cudaMemcpyHostToDevice);
@@ -195,27 +179,18 @@ int main()
 
     // check results
     bool correct = true;
-    int num_incorrect = 0;
-    for (int idx = 0; idx < M * N; idx++)
-    {
-        if (fabs(cpu_output[idx] - gpu_output[idx]) > 0.01f)
-        {
+    for (int idx = 0; idx < M * N; idx++) {
+        if (fabs(cpu_output[idx] - gpu_output[idx]) > 0.01f) {
             correct = false;
             int j = idx / M;
             int i = idx % M;
             printf(
-                "\n mismatch at (%d, %d): CPU=%.0f, GPU=%.0f\n",
+                "\nFirst mismatch at (%d, %d): CPU=%.0f, GPU=%.0f\n",
                 i,
                 j,
                 cpu_output[idx],
                 gpu_output[idx]);
-
-            num_incorrect++;
-            if (num_incorrect > 10)
-            {
-                break;
-            }
-            // break;
+            break;
         }
     }
 
