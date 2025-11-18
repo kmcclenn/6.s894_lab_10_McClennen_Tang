@@ -24,6 +24,19 @@ typedef __nv_bfloat16 bf16;
 #define TILE_N 64
 #define TILE_K 64
 #define WARP_GROUP_THREADS 128
+#define WGMMA_M 64
+#define WGMMA_K 16
+#define WGMMA_N 8
+
+// needed for wgmma
+#define THREADS_X 32
+#define THREADS_Y 4
+
+#define K_ITERS ((TILE_K) / (WGMMA_K))
+#define M_ITERS ((TILE_M) / (WGMMA_M))
+#define N_ITERS ((TILE_N) / (WGMMA_N))
+
+#define WGMMAS_PER_TILE (((TILE_M) / (WGMMA_M)) * ((TILE_N) / (WGMMA_N)) * ((TILE_K) / (WGMMA_K)))
 
 __global__ void h100_matmul(
     int M,
@@ -43,54 +56,86 @@ __global__ void h100_matmul(
     uint64_t *abar = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
     uint64_t *bbar = abar + 1;
 
-    int thread_id = threadIdx.x;
-    int lane_id = thread_id % 32;
-    int warp_id = thread_id / 32;
+    // int thread_id = threadIdx.x;
+
+    int lane_id = threadIdx.x;
+    int warp_id = threadIdx.y;
+    // int lane_id = thread_id % 32;
+    // int warp_id = thread_id / 32;
 
     int a_row = blockIdx.x * TILE_M;
     int b_row = blockIdx.y * TILE_N;
-    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (uint global_k = 0; global_k < K; global_k += TILE_K)
+    // initialize C to 0
+    for (int i = threadIdx.x; i < TILE_M; i += blockDim.x)
     {
-        int col_offset = global_k;
+        for (int j = threadIdx.y; j < TILE_N; j += blockDim.y)
+        {
+            C[(a_row + i) * N + (b_row + j)] = 0.0f;
+        }
+    }
 
-        if (thread_id == 0)
+    __syncthreads();
+
+    for (int global_k = 0; global_k < K; global_k += TILE_K)
+    {
+
+        if (threadIdx.x == 0 && threadIdx.y == 0)
         {
             init_barrier(abar, 1);
             init_barrier(bbar, 1);
             async_proxy_fence();
 
-            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, col_offset, abar);
+            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, abar);
             expect_bytes_and_arrive(abar, TILE_M * TILE_K * sizeof(bf16));
 
-            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, col_offset, bbar);
+            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, bbar);
             expect_bytes_and_arrive(bbar, TILE_N * TILE_K * sizeof(bf16));
 
             wait(abar, 0);
             wait(bbar, 0);
         }
+        __syncthreads();
 
-        uint64_t desc_a0 = make_smem_desc<SWIZZLE_64B>(a_shmem, 1, 512);
-        uint64_t desc_b0 = make_smem_desc<SWIZZLE_64B>(b_shmem, 1, 512);
-
-        uint64_t desc_a1 = make_smem_desc<SWIZZLE_64B>(a_shmem + 16, 1, 512);
-        uint64_t desc_b1 = make_smem_desc<SWIZZLE_64B>(b_shmem + 16, 1, 512);
-
-        warpgroup_arrive();
-        wgmma_n8<1, 1, 1, 0, 0>(desc_a0, desc_b0, d);
-        wgmma_n8<1, 1, 1, 0, 0>(desc_a1, desc_b1, d);
-        wgmma_commit();
-        wgmma_wait<0>();
-    }
-
-    for (int i = 0; i < 2; i++)
-    {
-        int m = 16 * warp_id + (i * 8) + (lane_id / 4);
-        for (int j = 0; j < 2; j++)
+        for (int row = 0; row < M_ITERS; row++)
         {
-            int n = ((lane_id % 4) * 2 + j);
-            C[n * TILE_M + m] = d[i * 2 + j];
+            for (int col = 0; col < N_ITERS; col++)
+            {
+                float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                // uint64_t desc_as[K_ITERS];
+                // uint64_t desc_bs[K_ITERS];
+
+                // gloabl ids
+                int row_id = row * WGMMA_M + a_row;
+                int col_id = col * WGMMA_N + b_row;
+
+                //
+                bf16 *a_tile = a_shmem + TILE_K * row * WGMMA_M;
+                bf16 *b_tile = b_shmem + TILE_K * col * WGMMA_N;
+
+                // #pragma unroll
+                warpgroup_arrive();
+                for (uint i = 0; i < K_ITERS; i++)
+                {
+                    uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, 256 * K_ITERS);
+                    uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, 256 * K_ITERS);
+                    wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d);
+                }
+                wgmma_commit();
+                wgmma_wait<0>();
+
+                // TODO writeback
+                for (int i = 0; i < 2; i++)
+                {
+                    int m = 16 * warp_id + (i * 8) + (lane_id / 4);
+                    for (int j = 0; j < 2; j++)
+                    {
+                        int n = ((lane_id % 4) * 2 + j);
+
+                        C[(m + row_id) * N + n + col_id] += d[i * 2 + j];
+                    }
+                }
+            }
         }
     }
 }
@@ -113,7 +158,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
             box_dim_a,
             element_strides_a,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B, // since tile size is 64x64 (changes w tile size)
+            CU_TENSOR_MAP_SWIZZLE_128B,
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
@@ -144,8 +189,9 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
         shmem_size_bytes));
     printf("shmem_size_bytes=%zu\n", shmem_size_bytes);
 
-    dim3 gridDim = dim3(CEIL_DIV(M, TILE_M), CEIL_DIV(N, TILE_N), 1);
-    h100_matmul<<<1, WARP_GROUP_THREADS, shmem_size_bytes>>>(M, N, K, A, B, C, A_map, B_map);
+    dim3 gridDim = dim3(CEIL_DIV(M, TILE_M), CEIL_DIV(N, TILE_N));
+    dim3 blockDim = dim3(THREADS_X, THREADS_Y); // for wgmma, TODO hardcoded fix
+    h100_matmul<<<gridDim, blockDim, shmem_size_bytes>>>(M, N, K, A, B, C, A_map, B_map);
 }
 
 /// <--- your code here --->
