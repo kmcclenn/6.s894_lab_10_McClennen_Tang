@@ -52,10 +52,12 @@ __global__ void h100_matmul(
     bf16 *b_shmem = a_shmem + (TILE_M * TILE_K);
     size_t tile_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16);
     size_t mbar_off = (tile_bytes + 16) & ~size_t(16);
-    uint64_t *mbar = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
+    uint64_t *abar = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
+    uint64_t *bbar = abar + 1;
 
     int lane_id = threadIdx.x;
     int warp_id = threadIdx.y;
+    int thread_id = warp_id * 32 + lane_id;
 
     int a_row = blockIdx.x * TILE_M;
     int b_row = blockIdx.y * TILE_N;
@@ -75,27 +77,30 @@ __global__ void h100_matmul(
         }
     }
 
+    if (thread_id == 0)
+    {
+        init_barrier(abar, 1);
+        init_barrier(bbar, 1);
+        async_proxy_fence();
+    }
+
+    bool phase = 0;
+
     // loop along K dimension over whole array
     for (int global_k = 0; global_k < K; global_k += TILE_K) // k
     {
-
         // tma load
-        if (threadIdx.x == 0 && threadIdx.y == 0)
+        if (thread_id == 0)
         {
+            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, abar);
+            expect_bytes_and_arrive(abar, TILE_M * TILE_K * sizeof(bf16));
 
-            init_barrier(mbar, 1);
+            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, bbar);
+            expect_bytes_and_arrive(bbar, TILE_N * TILE_K * sizeof(bf16));
 
-            async_proxy_fence();
-
-            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, mbar);
-            expect_bytes_and_arrive(mbar, TILE_M * TILE_K * sizeof(bf16));
-
-            wait(mbar, 0);
-
-            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, mbar);
-            expect_bytes_and_arrive(mbar, TILE_N * TILE_K * sizeof(bf16));
-
-            wait(mbar, 1);
+            wait(abar, phase);
+            wait(bbar, phase);
+            phase = !phase;
         }
         __syncthreads();
 
@@ -105,7 +110,6 @@ __global__ void h100_matmul(
         {
             for (int col = 0; col < N_ITERS; col++)
             {
-
                 // get the correct row of shmem
                 bf16 *a_tile = a_shmem + TILE_K * row * WGMMA_M;
                 bf16 *b_tile = b_shmem + TILE_K * col * WGMMA_N;
@@ -195,7 +199,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
-    printf("shmem_size_bytes=%zu\n", shmem_size_bytes);
+    // printf("shmem_size_bytes=%zu\n", shmem_size_bytes);
 
     dim3 gridDim = dim3(CEIL_DIV(M, TILE_M), CEIL_DIV(N, TILE_N));
     dim3 blockDim = dim3(THREADS_X, THREADS_Y); // for wgmma, TODO hardcoded fix
