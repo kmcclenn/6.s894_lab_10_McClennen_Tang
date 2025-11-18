@@ -60,11 +60,11 @@ __global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c, __grid_consta
     uint64_t desc_a1 = make_smem_desc<SWIZZLE_64B>(a_shmem + 16, 1, 512);
     uint64_t desc_b1 = make_smem_desc<SWIZZLE_64B>(b_shmem + 16, 1, 512);
 
-    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float d[2][4];
 
     warpgroup_arrive();
-    wgmma_n8<1, 1, 1, 0, 0>(desc_a0, desc_b0, d);
-    wgmma_n8<1, 1, 1, 0, 0>(desc_a1, desc_b1, d);
+    wgmma_n8<1, 1, 1, 0, 0>(desc_a0, desc_b0, d[0]);
+    wgmma_n8<1, 1, 1, 0, 0>(desc_a1, desc_b1, d[1]);
     wgmma_commit();
     wgmma_wait<0>();
 
@@ -74,7 +74,7 @@ __global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c, __grid_consta
         for (int j = 0; j < 2; j++)
         {
             int n = ((lane_id % 4) * 2 + j);
-            c[n * TILE_M + m] = d[i * 2 + j];
+            c[n * TILE_M + m] = d[0][i * 2 + j] + d[1][i * 2 + j];
         }
     }
 }

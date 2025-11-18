@@ -8,7 +8,8 @@ typedef __nv_bfloat16 bf16;
 // WARP GROUP SYNC
 ////////////////////////////////////////////////////////////////////////////////
 
-__device__ void warpgroup_arrive() {
+__device__ void warpgroup_arrive()
+{
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 
@@ -16,11 +17,14 @@ __device__ void warpgroup_arrive() {
 // WGMMA COMMIT GROUP FUNCTIONS
 ////////////////////////////////////////////////////////////////////////////////
 
-__device__ void wgmma_commit() {
+__device__ void wgmma_commit()
+{
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
-template <int N> __device__ void wgmma_wait() {
+template <int N>
+__device__ void wgmma_wait()
+{
     static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
@@ -29,32 +33,38 @@ template <int N> __device__ void wgmma_wait() {
 // WARP GROUP REGISTER ALLOCATION
 ////////////////////////////////////////////////////////////////////////////////
 
-template <uint32_t RegCount> __device__ void warpgroup_reg_alloc() {
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_alloc()
+{
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
-template <uint32_t RegCount> __device__ void warpgroup_reg_dealloc() {
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_dealloc()
+{
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // SHARED MEMORY DESCRIPTORS
 ////////////////////////////////////////////////////////////////////////////////
 
-enum wgmmaSwizzle {
+enum wgmmaSwizzle
+{
     NO_SWIZZLE,
     SWIZZLE_128B,
     SWIZZLE_64B,
     SWIZZLE_32B,
 };
 
-__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
+__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x)
+{
     return (((x) & 0x3FFFF) >> 0x4);
 }
 
 template <wgmmaSwizzle Swizzle>
-__device__ uint64_t make_smem_desc(bf16 *ptr, uint64_t lbo, uint64_t sbo) {
+__device__ uint64_t make_smem_desc(bf16 *ptr, uint64_t lbo, uint64_t sbo)
+{
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     uint64_t desc = 0x0000000000000000;
     desc |= matrix_descriptor_encode(addr);
@@ -63,15 +73,24 @@ __device__ uint64_t make_smem_desc(bf16 *ptr, uint64_t lbo, uint64_t sbo) {
 
     // Map swizzle enum to descriptor value: 0=no swizzle, 1=128B, 2=64B, 3=32B
     uint64_t swizzle_val;
-    if constexpr (Swizzle == NO_SWIZZLE) {
+    if constexpr (Swizzle == NO_SWIZZLE)
+    {
         swizzle_val = 0llu;
-    } else if constexpr (Swizzle == SWIZZLE_128B) {
+    }
+    else if constexpr (Swizzle == SWIZZLE_128B)
+    {
         swizzle_val = 1llu;
-    } else if constexpr (Swizzle == SWIZZLE_64B) {
+    }
+    else if constexpr (Swizzle == SWIZZLE_64B)
+    {
         swizzle_val = 2llu;
-    } else if constexpr (Swizzle == SWIZZLE_32B) {
+    }
+    else if constexpr (Swizzle == SWIZZLE_32B)
+    {
         swizzle_val = 3llu;
-    } else {
+    }
+    else
+    {
         static_assert(true, "Invalid wgmmaSwizzle value");
     }
 
@@ -84,7 +103,8 @@ __device__ uint64_t make_smem_desc(bf16 *ptr, uint64_t lbo, uint64_t sbo) {
 ////////////////////////////////////////////////////////////////////////////////
 
 template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma_n8(uint64_t desc_a, uint64_t desc_b, float d[4]) {
+__device__ void wgmma_n8(uint64_t desc_a, uint64_t desc_b, float d[4])
+{
     asm volatile("{\n"
                  "wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 "
                  "{%0,   %1,   %2,   %3},  "
@@ -99,7 +119,8 @@ __device__ void wgmma_n8(uint64_t desc_a, uint64_t desc_b, float d[4]) {
 }
 
 template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma_n256(uint64_t desc_a, uint64_t desc_b, float d[16][8]) {
+__device__ void wgmma_n256(uint64_t desc_a, uint64_t desc_b, float d[16][8])
+{
     asm volatile(
         "{\n"
         "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
@@ -157,4 +178,40 @@ __device__ void wgmma_n256(uint64_t desc_a, uint64_t desc_b, float d[16][8]) {
           "+f"(d[15][4]), "+f"(d[15][5]), "+f"(d[15][6]), "+f"(d[15][7])
         : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
           "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma_n64(uint64_t desc_a, uint64_t desc_b, float d[8][4])
+{
+
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,  %1,  %2,  %3,   "
+        " %4,  %5,  %6,  %7,   "
+        " %8,  %9,  %10, %11,  "
+        " %12, %13, %14, %15,  "
+        " %16, %17, %18, %19,  "
+        " %20, %21, %22, %23,  "
+        " %24, %25, %26, %27,  "
+        " %28, %29, %30, %31}, "
+        " %32, %33, %34, %35, %36, %37, %38;\n"
+        "}\n"
+        :
+        // 8 groups × 4 accumulators each:
+        "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]),
+        "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+        "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]),
+        "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]),
+        "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]),
+        "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]),
+        "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]),
+        "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3])
+        : "l"(desc_a),
+          "l"(desc_b),
+          "n"(int32_t(ScaleD)),
+          "n"(int32_t(ScaleA)),
+          "n"(int32_t(ScaleB)),
+          "n"(int32_t(TransA)),
+          "n"(int32_t(TransB)));
 }
