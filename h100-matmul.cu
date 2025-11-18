@@ -36,8 +36,6 @@ typedef __nv_bfloat16 bf16;
 #define M_ITERS ((TILE_M) / (WGMMA_M))
 #define N_ITERS ((TILE_N) / (WGMMA_N))
 
-#define WGMMAS_PER_TILE (((TILE_M) / (WGMMA_M)) * ((TILE_N) / (WGMMA_N)) * ((TILE_K) / (WGMMA_K)))
-
 __global__ void h100_matmul(
     int M,
     int N,
@@ -53,8 +51,10 @@ __global__ void h100_matmul(
     bf16 *b_shmem = a_shmem + (TILE_M * TILE_K);
     size_t tile_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16);
     size_t mbar_off = (tile_bytes + 16) & ~size_t(16);
-    uint64_t *abar = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
-    uint64_t *bbar = abar + 1;
+    uint64_t *mbar = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
+    // uint64_t *bbar = abar + 1;
+
+    // __shared__ uint64_t *mbar;
 
     // int thread_id = threadIdx.x;
 
@@ -66,48 +66,72 @@ __global__ void h100_matmul(
     int a_row = blockIdx.x * TILE_M;
     int b_row = blockIdx.y * TILE_N;
 
-    // initialize C to 0
-    for (int i = threadIdx.x; i < TILE_M; i += blockDim.x)
-    {
-        for (int j = threadIdx.y; j < TILE_N; j += blockDim.y)
-        {
-            C[(a_row + i) * N + (b_row + j)] = 0.0f;
-        }
-    }
+    // // initialize C to 0
+    // for (int i = threadIdx.x; i < TILE_M; i += blockDim.x)
+    // {
+    //     for (int j = threadIdx.y; j < TILE_N; j += blockDim.y)
+    //     {
+    //         C[(a_row + i) * N + (b_row + j)] = 0.0f;
+    //     }
+    // }
 
-    __syncthreads();
+    // __syncthreads();
 
-    for (int global_k = 0; global_k < K; global_k += TILE_K)
+    // put in shared temporarily to see if pthe problem was register spillage 
+    __shared__ float d[M_ITERS][N_ITERS][4];
+
+    // #pragma unroll
+    // for (int row = 0; row < M_ITERS; row++)
+    // {
+    //     for (int col = 0; col < N_ITERS; col++)
+    //     {
+    //         for (int i = 0; i < 4; i++)
+    //         {
+    //             d[row][col][i] = 0.0f;
+    //         }
+    //     }
+    // }
+
+    // if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+    // {
+    //     printf("K: %d\n", K);
+    // }
+
+    for (int global_k = 0; global_k < K; global_k += TILE_K) // k
     {
 
         if (threadIdx.x == 0 && threadIdx.y == 0)
         {
-            init_barrier(abar, 1);
-            init_barrier(bbar, 1);
+            // if (blockIdx.x == 0 && blockIdx.y == 0)
+            // {
+            //     printf("iter %d, d: %f\n", global_k, d[0][0][0]);
+            // }
+            init_barrier(mbar, 1);
+            // init_barrier(bbar, 1);
             async_proxy_fence();
 
-            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, abar);
-            expect_bytes_and_arrive(abar, TILE_M * TILE_K * sizeof(bf16));
+            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, mbar);
+            expect_bytes_and_arrive(mbar, TILE_M * TILE_K * sizeof(bf16));
 
-            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, bbar);
-            expect_bytes_and_arrive(bbar, TILE_N * TILE_K * sizeof(bf16));
+            wait(mbar, 0);
+            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, mbar);
+            expect_bytes_and_arrive(mbar, TILE_N * TILE_K * sizeof(bf16));
 
-            wait(abar, 0);
-            wait(bbar, 0);
+            wait(mbar, 1);
         }
         __syncthreads();
 
-        for (int row = 0; row < M_ITERS; row++)
+        for (int row = 0; row < M_ITERS; row++) // m_iters
         {
-            for (int col = 0; col < N_ITERS; col++)
+            for (int col = 0; col < N_ITERS; col++) // n_iters
             {
-                float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
                 // uint64_t desc_as[K_ITERS];
                 // uint64_t desc_bs[K_ITERS];
 
                 // gloabl ids
-                int row_id = row * WGMMA_M + a_row;
-                int col_id = col * WGMMA_N + b_row;
+                // int row_id = row * WGMMA_M + a_row;
+                // int col_id = col * WGMMA_N + b_row;
 
                 //
                 bf16 *a_tile = a_shmem + TILE_K * row * WGMMA_M;
@@ -115,25 +139,47 @@ __global__ void h100_matmul(
 
                 // #pragma unroll
                 warpgroup_arrive();
-                for (uint i = 0; i < K_ITERS; i++)
+                for (uint i = 0; i < K_ITERS; i++) // k_iters
                 {
-                    uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, 256 * K_ITERS);
-                    uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, 256 * K_ITERS);
-                    wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d);
+                    // 2 bytes per elt, TILE_K elts across, 8 elts down in block
+                    int sbo = sizeof(bf16) * TILE_K * 8;
+                    uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, sbo);
+                    uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, sbo);
+                    wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d[row][col]);
+                    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0 && row == 0 && col == 0)
+                    // {
+                    //     printf("iter %d right after k loop, d: %f\n", global_k, d[0][0][0]);
+                    // }
                 }
                 wgmma_commit();
                 wgmma_wait<0>();
+            }
+        }
+        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0)
+        // {
+        //     printf("iter %d, d: %f\n", global_k, d[0][0][0]);
+        // }
 
-                // TODO writeback
-                for (int i = 0; i < 2; i++)
+        __syncthreads();
+    }
+
+    // __syncthreads();
+
+    //
+    for (int row = 0; row < M_ITERS; row++)
+    {
+        for (int col = 0; col < N_ITERS; col++)
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                int m = 16 * warp_id + (i * 8) + (lane_id / 4);
+                for (int j = 0; j < 2; j++)
                 {
-                    int m = 16 * warp_id + (i * 8) + (lane_id / 4);
-                    for (int j = 0; j < 2; j++)
-                    {
-                        int n = ((lane_id % 4) * 2 + j);
+                    int n = ((lane_id % 4) * 2 + j);
+                    int row_id = row * WGMMA_M + a_row;
+                    int col_id = col * WGMMA_N + b_row;
 
-                        C[(m + row_id) * N + n + col_id] += d[i * 2 + j];
-                    }
+                    C[(n + col_id) * M + m + row_id] = d[row][col][i * 2 + j];
                 }
             }
         }
@@ -182,7 +228,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) + sizeof(uint64_t) * 2;
+    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) + sizeof(uint64_t);
     CUDA_CHECK(cudaFuncSetAttribute(
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -262,7 +308,8 @@ void init_matrix(bf16 *mat, int N)
     std::normal_distribution<float> distribution(0, 1);
     for (int i = 0; i < N; i++)
     {
-        mat[i] = distribution(generator);
+        mat[i] = 1;
+        // distribution(generator);
     }
 }
 
