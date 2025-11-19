@@ -35,7 +35,7 @@ typedef __nv_bfloat16 bf16;
 #define WARPGROUPS 3
 #define CONSUMERS (WARPGROUPS - 1)
 
-#define BUFFERS 2
+#define BUFFERS 4
 
 #define K_ITERS ((TILE_K) / (WGMMA_K))
 #define M_ITERS ((TILE_M / CONSUMERS) / (WGMMA_M))
@@ -59,10 +59,6 @@ __global__ void h100_matmul(
 
     // TODO: refactor to use buffers once working
     bf16 *a_shmem[2][2];
-    // for (int i = 0; i < 4; i++)
-    // {
-    //     a_shmem[i] = shmem_ptr + i * A_TILE_ELEMS;
-    // }
     for (int i = 0; i < 2; i++)
     {
         for (int j = 0; j < 2; j++)
@@ -145,7 +141,7 @@ __global__ void h100_matmul(
 
                 // wait(consumed[0], cphase);
                 int bar_id = m_tile * CONSUMERS + buffer_id;
-                if (k_tile >= BUFFERS)
+                if (k_tile >= (BUFFERS / CONSUMERS))
                 {
                     wait(consumed[bar_id], !phase);
                 }
@@ -171,6 +167,7 @@ __global__ void h100_matmul(
 
             wait(produced[bar_id], phase);
             // for each wgmma core tile in the larger tile
+            warpgroup_arrive();
             for (int row = 0; row < M_ITERS; row++)
             {
                 for (int col = 0; col < N_ITERS; col++)
@@ -188,13 +185,12 @@ __global__ void h100_matmul(
                         uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, sbo);
                         uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, sbo);
 
-                        warpgroup_arrive();
                         wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d[row][col]);
-                        wgmma_commit();
-                        wgmma_wait<0>();
                     }
                 }
             }
+            wgmma_commit();
+            wgmma_wait<0>();
             arrive(consumed[bar_id], 1);
         }
     }
