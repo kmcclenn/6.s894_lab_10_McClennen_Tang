@@ -146,8 +146,8 @@ __global__ void h100_matmul(
                     wait(consumed[bar_id], !phase);
                 }
 
-                cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, a_row, global_k, produced[bar_id]);
-                cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, b_row, global_k, produced[bar_id]);
+                cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row, produced[bar_id]);
+                cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row, produced[bar_id]);
                 expect_bytes_and_arrive(produced[bar_id], ((TILE_M / CONSUMERS) * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
             }
         }
@@ -344,8 +344,7 @@ void init_matrix(bf16 *mat, int N)
     std::normal_distribution<float> distribution(0, 1);
     for (int i = 0; i < N; i++)
     {
-        mat[i] = 1;
-        // distribution(generator);
+        mat[i] = distribution(generator);
     }
 }
 
