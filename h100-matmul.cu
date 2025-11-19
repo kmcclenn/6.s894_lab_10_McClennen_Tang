@@ -88,6 +88,9 @@ __global__ void h100_matmul(
         init_barrier(consumed, 128);
         async_proxy_fence();
     }
+
+    bool pphase = 0;
+    bool cphase = 1;
     __syncthreads();
     // start queueing wgmma operations for the next iteration before the first one is done
 
@@ -95,27 +98,22 @@ __global__ void h100_matmul(
     for (int global_k = 0; global_k < K; global_k += TILE_K) // k
     {
         // tma load
-        bool phase = ((global_k / TILE_K) % 2) == 0;
+
         if (is_producer && threadIdx.x == 0 && threadIdx.y == 0)
         {
-            if (global_k > 0)
-            {
-                wait(consumed, !phase);
-            }
+            wait(consumed, cphase);
             cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, produced);
-            // expect_bytes_and_arrive(produced, TILE_M * TILE_K * sizeof(bf16));
-
             cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, produced);
             expect_bytes_and_arrive(produced, (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
-
-            // wait(bbar, phase);
         }
+
+        cphase = !cphase;
 
         // __syncthreads();
 
         if (!is_producer)
         {
-            wait(produced, phase);
+            wait(produced, pphase);
             arrive(consumed, 1);
             // for each wgmma core tile in the larger tile
             for (int row = 0; row < M_ITERS; row++)
@@ -143,38 +141,38 @@ __global__ void h100_matmul(
                 }
             }
         }
+        pphase = !pphase;
     }
 
-    // if (is_producer)
-    // {
-    //     for (int row = 0; row < M_ITERS; row++)
-    //     {
-    //         for (int col = 0; col < N_ITERS; col++)
-    //         {
-    //             for (int i = 0; i < 2; i++)
-    //             {
-    //                 int m = 16 * warp_id + (i * 8) + (lane_id / 4);
-    //                 for (int j = 0; j < 2; j++)
-    //                 {
-    //                     int n = ((lane_id % 4) * 2 + j);
-    //                     int row_id = row * WGMMA_M + a_row;
-    //                     int col_id = col * WGMMA_N + b_row;
+    if (!is_producer)
+    {
+        // writeback results to global memory
+        for (int row = 0; row < M_ITERS; row++)
+        {
+            for (int col = 0; col < N_ITERS; col++)
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    int m = 16 * warp_id + (i * 8) + (lane_id / 4);
+                    for (int j = 0; j < 2; j++)
+                    {
+                        int n = ((lane_id % 4) * 2 + j);
+                        int row_id = row * WGMMA_M + a_row;
+                        int col_id = col * WGMMA_N + b_row;
 
-    //                     C[(n + col_id) * M + m + row_id] = d[row][col][i * 2 + j];
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-
-    // }
+                        C[(n + col_id) * M + m + row_id] = d[row][col][i * 2 + j];
+                    }
+                }
+            }
+        }
+    }
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
 {
     CUtensorMap A_map;
-    const cuuint64_t global_dim_a[2] = {static_cast<cuuint64_t>(K), static_cast<cuuint64_t>(M)};
-    const cuuint64_t global_strides_a[1] = {static_cast<cuuint64_t>(K * sizeof(bf16))};
+    const cuuint64_t global_dim_a[2] = {K, M};
+    const cuuint64_t global_strides_a[1] = {K * sizeof(bf16)};
     const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
     const cuuint32_t element_strides_a[2] = {1, 1};
     CUDA_CHECK(
@@ -193,8 +191,8 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     CUtensorMap B_map;
-    const cuuint64_t global_dim_b[2] = {static_cast<cuuint64_t>(K), static_cast<cuuint64_t>(N)};
-    const cuuint64_t global_strides_b[1] = {static_cast<cuuint64_t>(K * sizeof(bf16))};
+    const cuuint64_t global_dim_b[2] = {K, N};
+    const cuuint64_t global_strides_b[1] = {K * sizeof(bf16)};
     const cuuint32_t box_dim_b[2] = {TILE_K, TILE_N};
     const cuuint32_t element_strides_b[2] = {1, 1};
     CUDA_CHECK(
