@@ -108,22 +108,26 @@ __global__ void h100_matmul(
     // start queueing wgmma operations for the next iteration before the first one is done
 
     // loop along K dimension over whole array
-    for (int global_k = 0; global_k < K; global_k += TILE_K) // k
+    int num_tiles = CEIL_DIV(K, TILE_K);
+    for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
     {
         // tma load
-        int phase = (global_k / TILE_K) % 2;
-        bf16 *a_shmem = phase ? a_shmem1 : a_shmem0;
-        bf16 *b_shmem = phase ? b_shmem1 : b_shmem0;
+        int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
+        bf16 *a_shmem = buffer_id ? a_shmem1 : a_shmem0;
+        bf16 *b_shmem = buffer_id ? b_shmem1 : b_shmem0;
+
+        int phase = (k_tile / 2) % 2; //
+        int global_k = k_tile * TILE_K;
         if (is_producer && lane_id == 0 && warp_id == 0)
         {
             // wait(consumed[0], cphase);
-            if (global_k > 0)
+            if (k_tile >= BUFFERS)
             {
-                wait(consumed[0], !phase);
+                wait(consumed[buffer_id], !phase);
             }
-            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, produced[0]);
-            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, produced[0]);
-            expect_bytes_and_arrive(produced[0], (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
+            cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, produced[buffer_id]);
+            cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, produced[buffer_id]);
+            expect_bytes_and_arrive(produced[buffer_id], (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
         }
 
         // cphase = !cphase;
@@ -132,8 +136,7 @@ __global__ void h100_matmul(
 
         if (!is_producer)
         {
-            wait(produced[0], phase);
-
+            wait(produced[buffer_id], phase);
             // for each wgmma core tile in the larger tile
             for (int row = 0; row < M_ITERS; row++)
             {
@@ -159,7 +162,7 @@ __global__ void h100_matmul(
                     }
                 }
             }
-            arrive(consumed[0], 1);
+            arrive(consumed[buffer_id], 1);
         }
         // pphase = !pphase;
     }
