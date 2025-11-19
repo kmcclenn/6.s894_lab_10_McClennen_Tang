@@ -51,11 +51,14 @@ __global__ void h100_matmul(
     __grid_constant__ const CUtensorMap B_map)
 {
     extern __shared__ __align__(128) unsigned char shmem_raw[];
-    bf16 *a_shmem = reinterpret_cast<bf16 *>(shmem_raw);
+    bf16 *a_shmem0 = reinterpret_cast<bf16 *>(shmem_raw);
+    bf16 *b_shmem0 = a_shmem0 + (TILE_M * TILE_K);
 
-    bf16 *b_shmem = a_shmem + (TILE_M * TILE_K);
-    size_t tile_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16);
-    size_t mbar_off = (tile_bytes + 16) & ~size_t(16);
+    bf16 *a_shmem1 = b_shmem0 + (TILE_N * TILE_K);
+    bf16 *b_shmem1 = a_shmem1 + (TILE_M * TILE_K);
+
+    size_t tile_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16) * BUFFERS;
+    // size_t mbar_off = (tile_bytes + 16) & ~size_t(16);
     // uint64_t *produced = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
     // uint64_t *consumed = produced + 1;
     __shared__ __align__(8) uint64_t pbar[BUFFERS];
@@ -99,8 +102,8 @@ __global__ void h100_matmul(
         async_proxy_fence();
     }
 
-    bool pphase = 0;
-    bool cphase = 1;
+    // bool pphase = 0;
+    // bool cphase = 1;
     __syncthreads();
     // start queueing wgmma operations for the next iteration before the first one is done
 
@@ -108,21 +111,28 @@ __global__ void h100_matmul(
     for (int global_k = 0; global_k < K; global_k += TILE_K) // k
     {
         // tma load
+        int phase = (global_k / TILE_K) % 2;
+        bf16 *a_shmem = phase ? a_shmem1 : a_shmem0;
+        bf16 *b_shmem = phase ? b_shmem1 : b_shmem0;
         if (is_producer && lane_id == 0 && warp_id == 0)
         {
-            wait(consumed[0], cphase);
+            // wait(consumed[0], cphase);
+            if (global_k > 0)
+            {
+                wait(consumed[0], !phase);
+            }
             cp_async_bulk_tensor_2d_global_to_shared(a_shmem, &A_map, a_row, global_k, produced[0]);
             cp_async_bulk_tensor_2d_global_to_shared(b_shmem, &B_map, b_row, global_k, produced[0]);
             expect_bytes_and_arrive(produced[0], (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
         }
 
-        cphase = !cphase;
+        // cphase = !cphase;
 
         // __syncthreads();
 
         if (!is_producer)
         {
-            wait(produced[0], pphase);
+            wait(produced[0], phase);
 
             // for each wgmma core tile in the larger tile
             for (int row = 0; row < M_ITERS; row++)
@@ -151,7 +161,7 @@ __global__ void h100_matmul(
             }
             arrive(consumed[0], 1);
         }
-        pphase = !pphase;
+        // pphase = !pphase;
     }
 
     if (!is_producer)
@@ -220,7 +230,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) + sizeof(uint64_t);
+    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) * 2 + sizeof(uint64_t) * 4;
     CUDA_CHECK(cudaFuncSetAttribute(
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
