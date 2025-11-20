@@ -123,33 +123,31 @@ __global__ void h100_matmul(
 
     // loop along K dimension over whole array
     int num_tiles = CEIL_DIV(K, TILE_K);
-    if (is_producer && lane_id == 0 && warp_id == 0)
+    if (is_producer && lane_id < 2 && warp_id == 0)
     {
         for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
         {
-            for (int m_tile = 0; m_tile < 2; m_tile++)
+            int m_tile = lane_id;
+            // tma load
+            int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
+            bf16 *a_buf = a_shmem[m_tile][buffer_id];
+            bf16 *b_buf = b_shmem[m_tile][buffer_id];
+
+            int phase = (k_tile / 2) % 2;
+            int global_k = k_tile * TILE_K;
+            int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
+            int b_row = b_row_base;
+
+            // wait(consumed[0], cphase);
+            int bar_id = m_tile * CONSUMERS + buffer_id;
+            if (k_tile >= (BUFFERS / CONSUMERS))
             {
-                // tma load
-                int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
-                bf16 *a_buf = a_shmem[m_tile][buffer_id];
-                bf16 *b_buf = b_shmem[m_tile][buffer_id];
-
-                int phase = (k_tile / 2) % 2;
-                int global_k = k_tile * TILE_K;
-                int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
-                int b_row = b_row_base;
-
-                // wait(consumed[0], cphase);
-                int bar_id = m_tile * CONSUMERS + buffer_id;
-                if (k_tile >= (BUFFERS / CONSUMERS))
-                {
-                    wait(consumed[bar_id], !phase);
-                }
-
-                cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row, produced[bar_id]);
-                cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row, produced[bar_id]);
-                expect_bytes_and_arrive(produced[bar_id], ((TILE_M / CONSUMERS) * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
+                wait(consumed[bar_id], !phase);
             }
+
+            cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row, produced[bar_id]);
+            cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row, produced[bar_id]);
+            expect_bytes_and_arrive(produced[bar_id], ((TILE_M / CONSUMERS) * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
         }
     }
 
@@ -191,6 +189,7 @@ __global__ void h100_matmul(
             }
             wgmma_commit();
             wgmma_wait<0>();
+            warpgroup_arrive();
             arrive(consumed[bar_id], 1);
         }
     }
