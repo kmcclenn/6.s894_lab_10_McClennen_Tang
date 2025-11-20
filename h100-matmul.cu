@@ -21,12 +21,12 @@ typedef __nv_bfloat16 bf16;
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define TILE_M 128
-#define TILE_N 64
+#define TILE_N 256
 #define TILE_K 64
 #define WARP_GROUP_THREADS 128
 #define WGMMA_M 64
 #define WGMMA_K 16
-#define WGMMA_N 8
+#define WGMMA_N 256
 
 // needed for wgmma
 #define THREADS_X 32
@@ -92,15 +92,18 @@ __global__ void h100_matmul(
 
     bool is_producer = wg_id == 0;
     // initialize d
-    float d[M_ITERS][N_ITERS][4];
+    float d[M_ITERS][N_ITERS][16][8];
 #pragma unroll
     for (int row = 0; row < M_ITERS; row++)
     {
         for (int col = 0; col < N_ITERS; col++)
         {
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 16; i++)
             {
-                d[row][col][i] = 0.0f;
+                for (int j = 0; j < 16; j++)
+                {
+                    d[row][col][i][j] = 0.0f;
+                }
             }
         }
     }
@@ -183,7 +186,7 @@ __global__ void h100_matmul(
                         uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, sbo);
                         uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, sbo);
 
-                        wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d[row][col]);
+                        wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, d[row][col]);
                     }
                 }
             }
@@ -204,17 +207,15 @@ __global__ void h100_matmul(
         {
             for (int col = 0; col < N_ITERS; col++)
             {
-                for (int i = 0; i < 2; i++)
+                for (int i = 0; i < 128; i++)
                 {
-                    int m = 16 * warp_id + (i * 8) + (lane_id / 4);
-                    for (int j = 0; j < 2; j++)
-                    {
-                        int n = ((lane_id % 4) * 2 + j);
-                        int row_id = row * WGMMA_M + a_row;
-                        int col_id = col * WGMMA_N + b_row;
+                    int m = 16 * warp_id + ((i / 2) & 1) * 8 + (lane_id / 4);
+                    int n = (lane_id % 4) * 2 + (i / 4) * 8 + (i % 2);
 
-                        C[(n + col_id) * M + m + row_id] = d[row][col][i * 2 + j];
-                    }
+                    int glob_n = b_row + col * WGMMA_N + n;
+                    int glob_m = a_row + row * WGMMA_M + m;
+
+                    C[glob_n * M + glob_m] = d[row][col][i / 8][i % 8];
                 }
             }
         }

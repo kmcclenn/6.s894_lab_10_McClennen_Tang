@@ -94,6 +94,16 @@ __global__ void wgmma_test(bf16 *a, bf16 *b, float *c,
     }
 }
 
+// for (int i = 0; i < 128; i++)
+// {
+//     int m = 16 * warp_id + (i / 2) & 1 * 8 + (lane_id / 4);
+//     int n = (lane_id % 4) * 2 + (i / 4) * 8 + (i % 2);
+
+//     int glob_n = b_row + n_mma * WGMMA_N + n;
+//     int glob_m = a_row + m_mma * WGMMA_M + m;
+
+//     C[glob_n * M + glob_m] = d[m_mma][n_mma][i / 8][i % 8];
+// }
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_wgmma_test(bf16 *a, bf16 *b, float *c)
 {
