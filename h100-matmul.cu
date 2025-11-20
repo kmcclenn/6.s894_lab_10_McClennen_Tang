@@ -35,21 +35,25 @@ typedef __nv_bfloat16 bf16;
 #define WARPGROUPS 3
 #define CONSUMERS (WARPGROUPS - 1)
 
+#define CONSUME_M ((TILE_M) / (CONSUMERS))
+
 #define BUFFERS 4
 
 #define K_ITERS ((TILE_K) / (WGMMA_K))
 #define M_ITERS ((TILE_M / CONSUMERS) / (WGMMA_M))
 #define N_ITERS ((TILE_N) / (WGMMA_N))
 
-__global__ void h100_matmul(
-    int M,
-    int N,
-    int K,
-    bf16 *A,
-    bf16 *B,
-    bf16 *C,
-    __grid_constant__ const CUtensorMap A_map,
-    __grid_constant__ const CUtensorMap B_map)
+__global__ void
+    __launch_bounds__(384, 1, 1)
+        h100_matmul(
+            int M,
+            int N,
+            int K,
+            bf16 *A,
+            bf16 *B,
+            bf16 *C,
+            __grid_constant__ const CUtensorMap A_map,
+            __grid_constant__ const CUtensorMap B_map)
 {
     extern __shared__ __align__(128) unsigned char shmem_raw[];
     bf16 *shmem_ptr = reinterpret_cast<bf16 *>(shmem_raw);
@@ -58,26 +62,22 @@ __global__ void h100_matmul(
     constexpr int B_TILE_ELEMS = TILE_N * TILE_K;
 
     // TODO: refactor to use buffers once working
-    bf16 *a_shmem[2][2];
+    bf16 *a_shmem[2];
     for (int i = 0; i < 2; i++)
     {
-        for (int j = 0; j < 2; j++)
-        {
-            a_shmem[i][j] = shmem_ptr + (i * 2 + j) * A_TILE_ELEMS;
-        }
-    }
-    bf16 *b_shmem[2][2];
-    bf16 *b_base = shmem_ptr + 4 * A_TILE_ELEMS;
-    for (int i = 0; i < 2; i++)
-    {
-        for (int j = 0; j < 2; j++)
-        {
-            b_shmem[i][j] = b_base + (i * 2 + j) * B_TILE_ELEMS;
-        }
+        a_shmem[i] = shmem_ptr + i * A_TILE_ELEMS;
     }
 
-    __shared__ __align__(8) uint64_t pbar[4];
-    __shared__ __align__(8) uint64_t cbar[4];
+    bf16 *b_shmem[2];
+    bf16 *b_base = shmem_ptr + 2 * A_TILE_ELEMS;
+    for (int i = 0; i < 2; i++)
+    {
+
+        b_shmem[i] = b_base + i * B_TILE_ELEMS;
+    }
+
+    __shared__ __align__(8) uint64_t pbar[2];
+    __shared__ __align__(8) uint64_t cbar[2];
 
     __shared__ uint64_t *produced[4];
     __shared__ uint64_t *consumed[4];
@@ -91,32 +91,17 @@ __global__ void h100_matmul(
     int b_row_base = blockIdx.y * TILE_N;
 
     bool is_producer = wg_id == 0;
-    // initialize d
-    float d[M_ITERS][N_ITERS][16][8];
-#pragma unroll
-    for (int row = 0; row < M_ITERS; row++)
-    {
-        for (int col = 0; col < N_ITERS; col++)
-        {
-            for (int i = 0; i < 16; i++)
-            {
-                for (int j = 0; j < 16; j++)
-                {
-                    d[row][col][i][j] = 0.0f;
-                }
-            }
-        }
-    }
 
     if (thread_id == 0)
     {
-        for (int i = 0; i < 4; i++)
+        // only need two barriers, one for each parity of k tile
+        for (int i = 0; i < 2; i++)
         {
             produced[i] = &pbar[i];
             consumed[i] = &cbar[i];
 
             init_barrier(produced[i], 1);
-            init_barrier(consumed[i], 128); // TODO: change back to 128 once buffering is fixed
+            init_barrier(consumed[i], CONSUMERS * WARP_GROUP_THREADS); // 2 wg * 128 threads each
         }
         async_proxy_fence();
     }
@@ -126,47 +111,66 @@ __global__ void h100_matmul(
 
     // loop along K dimension over whole array
     int num_tiles = CEIL_DIV(K, TILE_K);
-    if (is_producer && lane_id < 2 && warp_id == 0)
+    if (is_producer && lane_id == 0 && warp_id == 0)
     {
+        warpgroup_reg_dealloc<32>();
         for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
         {
             int m_tile = lane_id;
             // tma load
             int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
-            bf16 *a_buf = a_shmem[m_tile][buffer_id];
-            bf16 *b_buf = b_shmem[m_tile][buffer_id];
+            bf16 *a_buf = a_shmem[buffer_id];
+            bf16 *b_buf = b_shmem[buffer_id];
 
-            int phase = (k_tile / 2) % 2;
+            int phase = (k_tile / 2) % 2; // consumer increments every 2
             int global_k = k_tile * TILE_K;
-            int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
-            int b_row = b_row_base;
 
-            // wait(consumed[0], cphase);
-            int bar_id = m_tile * CONSUMERS + buffer_id;
-            if (k_tile >= (BUFFERS / CONSUMERS))
+            if (k_tile > 0) // beyond the first k tile, have to wait for consumer
             {
-                wait(consumed[bar_id], !phase);
+                wait(consumed[buffer_id], !phase);
             }
 
-            cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row, produced[bar_id]);
-            cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row, produced[bar_id]);
-            expect_bytes_and_arrive(produced[bar_id], ((TILE_M / CONSUMERS) * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
+            //
+            cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row_base, produced[buffer_id]);
+            cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row_base, produced[buffer_id]);
+
+            expect_bytes_and_arrive(produced[buffer_id], (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
         }
     }
 
     if (!is_producer)
     {
+        warpgroup_reg_alloc<160>();
+        // initialize d
+        float d[M_ITERS][N_ITERS][16][8];
+
+#pragma unroll
+        for (int row = 0; row < M_ITERS; row++)
+        {
+            for (int col = 0; col < N_ITERS; col++)
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    for (int j = 0; j < 16; j++)
+                    {
+                        d[row][col][i][j] = 0.0f;
+                    }
+                }
+            }
+        }
+
         // wg 1 processes m_tile 0, wg 2 processes m_tile 1
         int m_tile = wg_id - 1;
         for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
         {
-            int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
-            bf16 *a_buf = a_shmem[m_tile][buffer_id];
-            bf16 *b_buf = b_shmem[m_tile][buffer_id];
+            int buffer_id = k_tile % 2;                                     // odd k tiles to buf1, even to buf2
+            bf16 *a_buf = a_shmem[buffer_id] + m_tile * CONSUME_M * TILE_K; // offset to correct part of the 128 M block in A
+            bf16 *b_buf = b_shmem[buffer_id];
+
             int phase = (k_tile / 2) % 2;
             int bar_id = m_tile * CONSUMERS + buffer_id;
 
-            wait(produced[bar_id], phase);
+            wait(produced[buffer_id], phase);
             // for each wgmma core tile in the larger tile
             warpgroup_arrive();
             for (int row = 0; row < M_ITERS; row++)
@@ -193,13 +197,9 @@ __global__ void h100_matmul(
             wgmma_commit();
             wgmma_wait<0>();
             warpgroup_arrive();
-            arrive(consumed[bar_id], 1);
+            arrive(consumed[buffer_id], 1);
         }
-    }
 
-    if (!is_producer)
-    {
-        int m_tile = wg_id - 1;
         int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
         int b_row = b_row_base;
         // writeback results to global memory
@@ -227,7 +227,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
     CUtensorMap A_map;
     const cuuint64_t global_dim_a[2] = {static_cast<cuuint64_t>(K), static_cast<cuuint64_t>(M)};
     const cuuint64_t global_strides_a[1] = {static_cast<cuuint64_t>(K * sizeof(bf16))};
-    const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M / CONSUMERS};
+    const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
     const cuuint32_t element_strides_a[2] = {1, 1};
     CUDA_CHECK(
         cuTensorMapEncodeTiled(
@@ -264,7 +264,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) * 4 + sizeof(uint64_t) * 4;
+    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) * 2 + sizeof(uint64_t) * 4;
     CUDA_CHECK(cudaFuncSetAttribute(
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
