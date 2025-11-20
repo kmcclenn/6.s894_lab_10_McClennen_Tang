@@ -107,16 +107,17 @@ __global__ void
     }
 
     __syncthreads();
+
+    // someone said this in class idek:
     // start queueing wgmma operations for the next iteration before the first one is done
 
     // loop along K dimension over whole array
     int num_tiles = CEIL_DIV(K, TILE_K);
-    if (is_producer && lane_id == 0 && warp_id == 0)
+    if (thread_id == 0) // first thread of producer
     {
         warpgroup_reg_dealloc<32>();
         for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
         {
-            int m_tile = lane_id;
             // tma load
             int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
             bf16 *a_buf = a_shmem[buffer_id];
@@ -168,7 +169,6 @@ __global__ void
             bf16 *b_buf = b_shmem[buffer_id];
 
             int phase = (k_tile / 2) % 2;
-            int bar_id = m_tile * CONSUMERS + buffer_id;
 
             wait(produced[buffer_id], phase);
             // for each wgmma core tile in the larger tile
