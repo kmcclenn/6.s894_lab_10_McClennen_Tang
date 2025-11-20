@@ -39,8 +39,8 @@ typedef __nv_bfloat16 bf16;
 
 #define BUFFERS 4
 
-#define TILES_PER_BLOCK_M 2
-#define TILES_PER_BLOCK_N 1 // only works with this
+#define TILES_PER_BLOCK_M 1
+#define TILES_PER_BLOCK_N 2
 
 #define K_ITERS ((TILE_K) / (WGMMA_K))
 #define M_ITERS ((TILE_M / CONSUMERS) / (WGMMA_M))
@@ -115,117 +115,118 @@ __global__ void
 
     // loop along K dimension over whole array
     int num_tiles = CEIL_DIV(K, TILE_K);
-    for (int t = 0; t < TILES_PER_BLOCK_M * TILES_PER_BLOCK_N; t++)
+    for (int t_m = 0; t_m < TILES_PER_BLOCK_M; t_m++)
     {
-        int t_m = t % 2;
-        int t_n = t / 2;
-
-        int a_row_base = blockIdx.x * TILE_M * TILES_PER_BLOCK_M + t_m * TILE_M;
-        int b_row_base = blockIdx.y * TILE_N * TILES_PER_BLOCK_N + t_n * TILE_M;
-
-        if (thread_id == 0) // first thread of producer
+        for (int t_n = 0; t_n < TILES_PER_BLOCK_N; t_n++)
         {
-            warpgroup_reg_dealloc<32>();
-            for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
+
+            int a_row_base = blockIdx.x * TILE_M * TILES_PER_BLOCK_M + t_m * TILE_M;
+            int b_row_base = blockIdx.y * TILE_N * TILES_PER_BLOCK_N + t_n * TILE_N;
+
+            if (thread_id == 0) // first thread of producer
             {
-                // tma load
-                int buffer_id = k_tile % BUFFERS; // odd k tiles to buf1, even to buf2
-                bf16 *a_buf = a_shmem[buffer_id];
-                bf16 *b_buf = b_shmem[buffer_id];
-
-                int phase = (k_tile / BUFFERS) % 2; // consumer increments every 2
-                int global_k = k_tile * TILE_K;
-
-                if (k_tile > BUFFERS - 1 || t > 0) // beyond the first k tile, have to wait for consumer
+                warpgroup_reg_dealloc<32>();
+                for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
                 {
-                    wait(consumed[buffer_id], !phase);
+                    // tma load
+                    int buffer_id = k_tile % BUFFERS; // odd k tiles to buf1, even to buf2
+                    bf16 *a_buf = a_shmem[buffer_id];
+                    bf16 *b_buf = b_shmem[buffer_id];
+
+                    int phase = (k_tile / BUFFERS) % 2; // consumer increments every 2
+                    int global_k = k_tile * TILE_K;
+
+                    if (k_tile > BUFFERS - 1 || t_m > 0 || t_n > 0) // beyond the first k tile, have to wait for consumer
+                    {
+                        wait(consumed[buffer_id], !phase);
+                    }
+
+                    //
+                    cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row_base, produced[buffer_id]);
+                    cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row_base, produced[buffer_id]);
+
+                    expect_bytes_and_arrive(produced[buffer_id], (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
                 }
-
-                //
-                cp_async_bulk_tensor_2d_global_to_shared(a_buf, &A_map, global_k, a_row_base, produced[buffer_id]);
-                cp_async_bulk_tensor_2d_global_to_shared(b_buf, &B_map, global_k, b_row_base, produced[buffer_id]);
-
-                expect_bytes_and_arrive(produced[buffer_id], (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16));
             }
-        }
 
-        else if (!is_producer)
-        {
-            warpgroup_reg_alloc<160>();
-            // initialize d
-            float d[M_ITERS][N_ITERS][16][8];
+            else if (!is_producer)
+            {
+                warpgroup_reg_alloc<160>();
+                // initialize d
+                float d[M_ITERS][N_ITERS][16][8];
 
 #pragma unroll
-            for (int row = 0; row < M_ITERS; row++)
-            {
-                for (int col = 0; col < N_ITERS; col++)
-                {
-                    for (int i = 0; i < 16; i++)
-                    {
-                        for (int j = 0; j < 8; j++)
-                        {
-                            d[row][col][i][j] = 0.0f;
-                        }
-                    }
-                }
-            }
-
-            // wg 1 processes m_tile 0, wg 2 processes m_tile 1
-            int m_tile = wg_id - 1;
-            for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
-            {
-                int buffer_id = k_tile % BUFFERS;                               // odd k tiles to buf1, even to buf2
-                bf16 *a_buf = a_shmem[buffer_id] + m_tile * CONSUME_M * TILE_K; // offset to correct part of the 128 M block in A
-                bf16 *b_buf = b_shmem[buffer_id];
-
-                int phase = (k_tile / BUFFERS) % 2;
-
-                wait(produced[buffer_id], phase);
-                // for each wgmma core tile in the larger tile
-                warpgroup_arrive();
                 for (int row = 0; row < M_ITERS; row++)
                 {
                     for (int col = 0; col < N_ITERS; col++)
                     {
-                        // get the correct row of shmem
-                        bf16 *a_tile = a_buf + TILE_K * row * WGMMA_M;
-                        bf16 *b_tile = b_buf + TILE_K * col * WGMMA_N;
-
-                        // #pragma unroll
-                        for (uint i = 0; i < K_ITERS; i++) // k_iters
+                        for (int i = 0; i < 16; i++)
                         {
-                            // 2 bytes per elt, TILE_K elts across, 8 elts down in block
-                            int sbo = sizeof(bf16) * TILE_K * 8;
-
-                            uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, sbo);
-                            uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, sbo);
-
-                            wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, d[row][col]);
+                            for (int j = 0; j < 8; j++)
+                            {
+                                d[row][col][i][j] = 0.0f;
+                            }
                         }
                     }
                 }
-                wgmma_commit();
-                wgmma_wait<0>();
-                // warpgroup_arrive();
-                arrive(consumed[buffer_id], 1);
-            }
 
-            int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
-            int b_row = b_row_base;
-            // writeback results to global memory
-            for (int row = 0; row < M_ITERS; row++)
-            {
-                for (int col = 0; col < N_ITERS; col++)
+                // wg 1 processes m_tile 0, wg 2 processes m_tile 1
+                int m_tile = wg_id - 1;
+                for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
                 {
-                    for (int i = 0; i < 128; i++)
+                    int buffer_id = k_tile % BUFFERS;                               // odd k tiles to buf1, even to buf2
+                    bf16 *a_buf = a_shmem[buffer_id] + m_tile * CONSUME_M * TILE_K; // offset to correct part of the 128 M block in A
+                    bf16 *b_buf = b_shmem[buffer_id];
+
+                    int phase = (k_tile / BUFFERS) % 2;
+
+                    wait(produced[buffer_id], phase);
+                    // for each wgmma core tile in the larger tile
+                    warpgroup_arrive();
+                    for (int row = 0; row < M_ITERS; row++)
                     {
-                        int m = 16 * warp_id + ((i / 2) & 1) * 8 + (lane_id / 4);
-                        int n = (lane_id % 4) * 2 + (i / 4) * 8 + (i % 2);
+                        for (int col = 0; col < N_ITERS; col++)
+                        {
+                            // get the correct row of shmem
+                            bf16 *a_tile = a_buf + TILE_K * row * WGMMA_M;
+                            bf16 *b_tile = b_buf + TILE_K * col * WGMMA_N;
 
-                        int glob_n = b_row + col * WGMMA_N + n;
-                        int glob_m = a_row + row * WGMMA_M + m;
+                            // #pragma unroll
+                            for (uint i = 0; i < K_ITERS; i++) // k_iters
+                            {
+                                // 2 bytes per elt, TILE_K elts across, 8 elts down in block
+                                int sbo = sizeof(bf16) * TILE_K * 8;
 
-                        C[glob_n * M + glob_m] = d[row][col][i / 8][i % 8];
+                                uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, sbo);
+                                uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, sbo);
+
+                                wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, d[row][col]);
+                            }
+                        }
+                    }
+                    wgmma_commit();
+                    wgmma_wait<0>();
+                    // warpgroup_arrive();
+                    arrive(consumed[buffer_id], 1);
+                }
+
+                int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
+                int b_row = b_row_base;
+                // writeback results to global memory
+                for (int row = 0; row < M_ITERS; row++)
+                {
+                    for (int col = 0; col < N_ITERS; col++)
+                    {
+                        for (int i = 0; i < 128; i++)
+                        {
+                            int m = 16 * warp_id + ((i / 2) & 1) * 8 + (lane_id / 4);
+                            int n = (lane_id % 4) * 2 + (i / 4) * 8 + (i % 2);
+
+                            int glob_n = b_row + col * WGMMA_N + n;
+                            int glob_m = a_row + row * WGMMA_M + m;
+
+                            C[glob_n * M + glob_m] = d[row][col][i / 8][i % 8];
+                        }
                     }
                 }
             }
