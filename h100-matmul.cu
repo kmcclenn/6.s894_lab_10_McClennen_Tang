@@ -44,16 +44,16 @@ typedef __nv_bfloat16 bf16;
 #define N_ITERS ((TILE_N) / (WGMMA_N))
 
 __global__ void
-    __launch_bounds__(384, 1, 1)
-        h100_matmul(
-            int M,
-            int N,
-            int K,
-            bf16 *A,
-            bf16 *B,
-            bf16 *C,
-            __grid_constant__ const CUtensorMap A_map,
-            __grid_constant__ const CUtensorMap B_map)
+// __launch_bounds__(384, 1, 1f)
+h100_matmul(
+    int M,
+    int N,
+    int K,
+    bf16 *A,
+    bf16 *B,
+    bf16 *C,
+    __grid_constant__ const CUtensorMap A_map,
+    __grid_constant__ const CUtensorMap B_map)
 {
     extern __shared__ __align__(128) unsigned char shmem_raw[];
     bf16 *shmem_ptr = reinterpret_cast<bf16 *>(shmem_raw);
@@ -62,25 +62,25 @@ __global__ void
     constexpr int B_TILE_ELEMS = TILE_N * TILE_K;
 
     // TODO: refactor to use buffers once working
-    bf16 *a_shmem[2];
-    for (int i = 0; i < 2; i++)
+    bf16 *a_shmem[BUFFERS];
+    for (int i = 0; i < BUFFERS; i++)
     {
         a_shmem[i] = shmem_ptr + i * A_TILE_ELEMS;
     }
 
-    bf16 *b_shmem[2];
-    bf16 *b_base = shmem_ptr + 2 * A_TILE_ELEMS;
-    for (int i = 0; i < 2; i++)
+    bf16 *b_shmem[BUFFERS];
+    bf16 *b_base = shmem_ptr + BUFFERS * A_TILE_ELEMS;
+    for (int i = 0; i < BUFFERS; i++)
     {
 
         b_shmem[i] = b_base + i * B_TILE_ELEMS;
     }
 
-    __shared__ __align__(8) uint64_t pbar[2];
-    __shared__ __align__(8) uint64_t cbar[2];
+    __shared__ __align__(8) uint64_t pbar[BUFFERS];
+    __shared__ __align__(8) uint64_t cbar[BUFFERS];
 
-    __shared__ uint64_t *produced[4];
-    __shared__ uint64_t *consumed[4];
+    __shared__ uint64_t *produced[BUFFERS];
+    __shared__ uint64_t *consumed[BUFFERS];
 
     int lane_id = threadIdx.x;
     int warp_id = threadIdx.y;
@@ -95,12 +95,14 @@ __global__ void
     if (thread_id == 0)
     {
         // only need two barriers, one for each parity of k tile
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < BUFFERS; i++)
         {
             produced[i] = &pbar[i];
             consumed[i] = &cbar[i];
 
             init_barrier(produced[i], 1);
+
+            // todo check, do i need to split this up?
             init_barrier(consumed[i], CONSUMERS * WARP_GROUP_THREADS); // 2 wg * 128 threads each
         }
         async_proxy_fence();
@@ -115,18 +117,18 @@ __global__ void
     int num_tiles = CEIL_DIV(K, TILE_K);
     if (thread_id == 0) // first thread of producer
     {
-        warpgroup_reg_dealloc<32>();
+        // warpgroup_reg_dealloc<32>();
         for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
         {
             // tma load
-            int buffer_id = k_tile % 2; // odd k tiles to buf1, even to buf2
+            int buffer_id = k_tile % BUFFERS; // odd k tiles to buf1, even to buf2
             bf16 *a_buf = a_shmem[buffer_id];
             bf16 *b_buf = b_shmem[buffer_id];
 
-            int phase = (k_tile / 2) % 2; // consumer increments every 2
+            int phase = (k_tile / BUFFERS) % 2; // consumer increments every 2
             int global_k = k_tile * TILE_K;
 
-            if (k_tile > 0) // beyond the first k tile, have to wait for consumer
+            if (k_tile > BUFFERS - 1) // beyond the first k tile, have to wait for consumer
             {
                 wait(consumed[buffer_id], !phase);
             }
@@ -141,7 +143,7 @@ __global__ void
 
     if (!is_producer)
     {
-        warpgroup_reg_alloc<160>();
+        // warpgroup_reg_alloc<160>();
         // initialize d
         float d[M_ITERS][N_ITERS][16][8];
 
@@ -164,11 +166,11 @@ __global__ void
         int m_tile = wg_id - 1;
         for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
         {
-            int buffer_id = k_tile % 2;                                     // odd k tiles to buf1, even to buf2
+            int buffer_id = k_tile % BUFFERS;                               // odd k tiles to buf1, even to buf2
             bf16 *a_buf = a_shmem[buffer_id] + m_tile * CONSUME_M * TILE_K; // offset to correct part of the 128 M block in A
             bf16 *b_buf = b_shmem[buffer_id];
 
-            int phase = (k_tile / 2) % 2;
+            int phase = (k_tile / BUFFERS) % 2;
 
             wait(produced[buffer_id], phase);
             // for each wgmma core tile in the larger tile
@@ -264,7 +266,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) * 2 + sizeof(uint64_t) * 4;
+    size_t shmem_size_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16) * BUFFERS + sizeof(uint64_t) * BUFFERS;
     CUDA_CHECK(cudaFuncSetAttribute(
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
