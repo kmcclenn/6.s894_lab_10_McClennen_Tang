@@ -43,7 +43,7 @@ typedef __nv_bfloat16 bf16;
 #define TILES_PER_BLOCK_N 2
 
 #define K_ITERS ((TILE_K) / (WGMMA_K))
-#define M_ITERS ((TILE_M / CONSUMERS) / (WGMMA_M))
+#define M_ITERS (CONSUME_M / (WGMMA_M))
 #define N_ITERS ((TILE_N) / (WGMMA_N))
 
 __global__ void
@@ -66,16 +66,11 @@ __global__ void
 
     // TODO: refactor to use buffers once working
     bf16 *a_shmem[BUFFERS];
-    for (int i = 0; i < BUFFERS; i++)
-    {
-        a_shmem[i] = shmem_ptr + i * A_TILE_ELEMS;
-    }
-
     bf16 *b_shmem[BUFFERS];
     bf16 *b_base = shmem_ptr + BUFFERS * A_TILE_ELEMS;
     for (int i = 0; i < BUFFERS; i++)
     {
-
+        a_shmem[i] = shmem_ptr + i * A_TILE_ELEMS;
         b_shmem[i] = b_base + i * B_TILE_ELEMS;
     }
 
@@ -117,15 +112,15 @@ __global__ void
     int num_tiles = CEIL_DIV(K, TILE_K);
     for (int t_m = 0; t_m < TILES_PER_BLOCK_M; t_m++)
     {
+        // #pragma unroll
         for (int t_n = 0; t_n < TILES_PER_BLOCK_N; t_n++)
         {
-
-            int a_row_base = blockIdx.x * TILE_M * TILES_PER_BLOCK_M + t_m * TILE_M;
-            int b_row_base = blockIdx.y * TILE_N * TILES_PER_BLOCK_N + t_n * TILE_N;
-
             if (thread_id == 0) // first thread of producer
             {
                 warpgroup_reg_dealloc<32>();
+
+                int a_row_base = blockIdx.x * TILE_M * TILES_PER_BLOCK_M + t_m * TILE_M;
+                int b_row_base = blockIdx.y * TILE_N * TILES_PER_BLOCK_N + t_n * TILE_N;
                 for (int k_tile = 0; k_tile < num_tiles; k_tile++) // k
                 {
                     // tma load
@@ -151,11 +146,14 @@ __global__ void
 
             else if (!is_producer)
             {
+
                 warpgroup_reg_alloc<160>();
                 // initialize d
                 float d[M_ITERS][N_ITERS][16][8];
+                // #pragma unroll
 
-#pragma unroll
+                int a_row_base = blockIdx.x * TILE_M * TILES_PER_BLOCK_M + t_m * TILE_M;
+                int b_row_base = blockIdx.y * TILE_N * TILES_PER_BLOCK_N + t_n * TILE_N;
                 for (int row = 0; row < M_ITERS; row++)
                 {
                     for (int col = 0; col < N_ITERS; col++)
@@ -191,12 +189,11 @@ __global__ void
                             bf16 *a_tile = a_buf + TILE_K * row * WGMMA_M;
                             bf16 *b_tile = b_buf + TILE_K * col * WGMMA_N;
 
-                            // #pragma unroll
+                            int sbo = sizeof(bf16) * TILE_K * 8;
+#pragma unroll
                             for (uint i = 0; i < K_ITERS; i++) // k_iters
                             {
                                 // 2 bytes per elt, TILE_K elts across, 8 elts down in block
-                                int sbo = sizeof(bf16) * TILE_K * 8;
-
                                 uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(a_tile + i * WGMMA_K, 1, sbo);
                                 uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(b_tile + i * WGMMA_K, 1, sbo);
 
@@ -213,19 +210,23 @@ __global__ void
                 int a_row = a_row_base + m_tile * (TILE_M / CONSUMERS);
                 int b_row = b_row_base;
                 // writeback results to global memory
+                int m = 16 * warp_id + (lane_id / 4);
                 for (int row = 0; row < M_ITERS; row++)
                 {
                     for (int col = 0; col < N_ITERS; col++)
                     {
-                        for (int i = 0; i < 128; i++)
+                        for (int i = 0; i < 128; i += 4)
                         {
-                            int m = 16 * warp_id + ((i / 2) & 1) * 8 + (lane_id / 4);
-                            int n = (lane_id % 4) * 2 + (i / 4) * 8 + (i % 2);
+                            int n = (lane_id % 4) * 2 + (i / 4) * 8;
 
                             int glob_n = b_row + col * WGMMA_N + n;
                             int glob_m = a_row + row * WGMMA_M + m;
 
                             C[glob_n * M + glob_m] = d[row][col][i / 8][i % 8];
+                            C[(glob_n + 1) * M + glob_m] = d[row][col][(i + 1) / 8][(i + 1) % 8];
+
+                            C[(glob_n)*M + glob_m + 8] = d[row][col][(i + 2) / 8][(i + 2) % 8];
+                            C[(glob_n + 1) * M + glob_m + 8] = d[row][col][(i + 3) / 8][(i + 3) % 8];
                         }
                     }
                 }
@@ -233,7 +234,6 @@ __global__ void
         }
     }
 }
-
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
 {
     CUtensorMap A_map;
@@ -284,6 +284,8 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C)
     // printf("shmem_size_bytes=%zu\n", shmem_size_bytes);
 
     dim3 gridDim = dim3(CEIL_DIV(M, (TILE_M * TILES_PER_BLOCK_M)), CEIL_DIV(N, (TILE_N * TILES_PER_BLOCK_N)));
+
+    // printf("number of blocks: %d x %d = %d\n", gridDim.x, gridDim.y, gridDim.x * gridDim.y);
     dim3 blockDim = dim3(THREADS_X, THREADS_Y, WARPGROUPS); // for wgmma, TODO hardcoded fix
     h100_matmul<<<gridDim, blockDim, shmem_size_bytes>>>(M, N, K, A, B, C, A_map, B_map);
 }
